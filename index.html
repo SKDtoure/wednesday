@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tilt Parallax</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #151515; overflow: hidden; }
+  body { display: grid; place-items: center; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  .stage {
+    --ar: 1;
+    position: relative;
+    width: min(100vw, calc(100dvh * var(--ar)));
+    aspect-ratio: var(--ar);
+    overflow: hidden;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .layer {
+    position: absolute;
+    left: 0; top: 0; width: 100%; height: 100%;
+    object-fit: fill;
+    will-change: transform;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  .ui {
+    position: absolute; left: 0; right: 0; bottom: max(16px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    pointer-events: none;
+  }
+  button#enable {
+    pointer-events: auto;
+    font-weight: 600; font-size: 15px; line-height: 1; font-family: inherit;
+    padding: 12px 20px; border-radius: 999px; border: 0;
+    background: #f2f2f2; color: #151515; cursor: pointer;
+  }
+  button#enable:focus-visible { outline: 3px solid #7fb4ff; outline-offset: 3px; }
+  .hint {
+    font-size: 13px; color: #fff; background: rgba(0,0,0,.55);
+    padding: 6px 12px; border-radius: 999px;
+    transition: opacity .6s ease;
+  }
+  .hidden { display: none !important; }
+  .fade { opacity: 0; }
+</style>
+</head>
+<body>
+
+<main class="stage" id="stage" aria-label="Animated portrait that shifts as you tilt your phone or move your mouse. Tap for lightning.">
+  <div class="ui">
+    <button id="enable" class="hidden" type="button">Tap to enable tilt</button>
+    <div id="hint" class="hint hidden"></div>
+  </div>
+</main>
+
+<script>
+/* ======================= EDIT THESE ======================= */
+
+/*
+  LAYERS: list from BACK to FRONT (the order of lines = stacking order).
+
+  id          a short name the animation script uses
+  depth       0 = barely moves, 1+ = moves the most
+  controlled  true = the script fades this layer in and out (blink frames, glow, lightning)
+  rotate / idleRotate / breathe / origin   optional, same as before
+
+  Every layer of the portrait (base, blinks, glowbase, eye glow) shares PORTRAIT
+  settings so they always move together and never drift apart.
+*/
+const PORTRAIT = { depth: 0.60, breathe: 0.006, origin: "50% 85%" };
+
+const LAYERS = [
+  { id: "background", src: "layer1-wednesday-prt-background.png", depth: 0.15 },
+
+  // Text that flashes after each lightning strike, like screen burn (script-controlled)
+  { id: "snap1", src: "layer2-wednesday-prt-snap1.png", depth: 0.25, controlled: true },
+  { id: "snap2", src: "layer2-wednesday-prt-snap2.png", depth: 0.25, controlled: true },
+
+  // Lightning, behind the portrait
+  { id: "light1", src: "layer3-wednesday-prt-light1.png", depth: 0.30, controlled: true },
+  { id: "light2", src: "layer3-wednesday-prt-light2.png", depth: 0.30, controlled: true },
+  { id: "light3", src: "layer3-wednesday-prt-light3.png", depth: 0.30, controlled: true },
+
+  // Portrait: normal state and its blink frames
+  { id: "base",     src: "layer4-wednesday-prt-base.png",     ...PORTRAIT },
+  { id: "eyeblnk1", src: "layer5-wednesday-prt-eyeblnk1.png", ...PORTRAIT, controlled: true }, // half blink
+  { id: "eyeblnk2", src: "layer5-wednesday-prt-eyeblnk2.png", ...PORTRAIT, controlled: true }, // closed
+
+  // Portrait: glowing state (eyes glow + rim light) and its blink frames.
+  // These sit ABOVE glowbase in the list so the blink frames show on top of it.
+  { id: "glowbase", src: "layer6-wednesday-prt-glowbase.png", ...PORTRAIT, controlled: true },
+  { id: "eyeglow1", src: "layer5-wednesday-prt-eyeglow1.png", ...PORTRAIT, controlled: true }, // 1st half blink (glowing)
+  { id: "eyeglow2", src: "layer5-wednesday-prt-eyeglow2.png", ...PORTRAIT, controlled: true }, // 2nd half blink (glowing)
+
+  // The hand on her shoulder. Its depth is close to the portrait's so it stays on her shoulder.
+  // origin = where the hand touches the shoulder, as "x% y%" of the whole canvas (EDIT THIS).
+  // breatheX 1 = swells evenly in every direction; breathPhase offsets it from her breathing.
+  { id: "thing", src: "layer7-wednesday-prt-thing.png", depth: 0.60,
+    breathe: 0.010, breatheX: 1, breathPeriod: 3.4, breathPhase: 1.0, origin: "50% 60%" }
+];
+
+// ---- Movement feel ----
+const MAX_SHIFT = 0.03;      // front-layer travel as a fraction of image width
+const TILT_RANGE = 20;       // degrees of phone tilt for full movement
+const SMOOTHING = 0.08;      // 0.04 = floaty, 0.15 = snappy
+const DIRECTION = 1;         // set to -1 if the movement feels backwards
+const BREATH_PERIOD = 4.2;   // seconds per breath
+const IDLE_PERIOD = 7;       // seconds per idle sway cycle
+
+// ---- Blink: normal state. Each step is [seconds, layer to show] (null = nothing) ----
+const BLINK = [[0.05, "eyeblnk1"], [0.09, "eyeblnk2"], [0.06, "eyeblnk1"]];
+const BLINK_GAP = [2.5, 6];  // random wait between blinks (min, max seconds)
+
+// ---- Lightning strike ----
+const FIRST_STRIKE = 4;      // seconds before the first strike
+const STRIKE_GAP = [8, 14];  // random wait between strikes (min, max seconds)
+const STRIKE_LIGHTS = [
+  [0.06, "light1"], [0.06, "light2"], [0.08, "light3"],
+  [0.07, null],
+  [0.07, "light2"], [0.05, null], [0.06, "light1"]
+];
+const GLOW_HOLD = 3.0;       // seconds the glowing state lasts (from the strike)
+const GLOW_FADE = 0.8;       // seconds to fade back to normal
+const GLOW_BLINK_AT = 1.8;   // seconds after the strike when the glowing eyes blink
+const GLOW_BLINK = [
+  [0.06, "eyeglow1"], [0.06, "eyeglow2"], [0.10, "eyeblnk2"], [0.06, "eyeglow2"], [0.06, "eyeglow1"]
+];
+
+// ---- Snap text (screen-burn flash after each strike). Times are seconds after the strike ----
+const SNAP1_AT = 0.12;       // when the first text pops on
+const SNAP2_AT = 0.30;       // when the second text pops on
+const SNAP_HOLD = 0.5;       // how long each stays at full brightness (with a slight flicker)
+const SNAP_FADE = 1.6;       // how long each takes to fade out
+
+/* ======================= CODE ======================= */
+
+const stage = document.getElementById("stage");
+const enableBtn = document.getElementById("enable");
+const hint = document.getElementById("hint");
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const rand = ([a, b]) => a + Math.random() * (b - a);
+const TAU = Math.PI * 2;
+
+// Build the layers
+const layers = LAYERS.map((cfg, i) => {
+  const img = new Image();
+  img.className = "layer";
+  img.alt = "";
+  img.draggable = false;
+  img.src = cfg.src;
+  img.style.transformOrigin = cfg.origin || "50% 50%";
+  if (cfg.controlled) img.style.opacity = 0;
+  stage.insertBefore(img, stage.querySelector(".ui"));
+  return {
+    id: cfg.id,
+    el: img,
+    depth: cfg.depth,
+    rotate: cfg.rotate || 0,
+    idleRotate: cfg.idleRotate || 0,
+    breathe: cfg.breathe || 0,
+    breatheX: cfg.breatheX != null ? cfg.breatheX : 0.35,
+    breathPeriod: cfg.breathPeriod || BREATH_PERIOD,
+    breathPhase: cfg.breathPhase || 0,
+    controlled: !!cfg.controlled,
+    phase: i * 1.7,
+    shift: 0,
+    lastOp: -1
+  };
+});
+
+// Match stage to the first layer's aspect ratio
+function setAspect() {
+  const first = layers[0].el;
+  if (first.naturalWidth) stage.style.setProperty("--ar", first.naturalWidth / first.naturalHeight);
+  sizeLayers();
+}
+layers[0].el.addEventListener("load", setAspect);
+if (layers[0].el.complete) setAspect();
+
+// Each layer is enlarged by the distance it can travel, so edges never show.
+function sizeLayers() {
+  const w = stage.clientWidth;
+  const h = stage.clientHeight;
+  layers.forEach(l => {
+    l.shift = l.depth * MAX_SHIFT * w;
+    const pad = l.shift;
+    l.el.style.left = -pad + "px";
+    l.el.style.top = -pad + "px";
+    l.el.style.width = (w + pad * 2) + "px";
+    l.el.style.height = (h + pad * 2) + "px";
+  });
+}
+new ResizeObserver(sizeLayers).observe(stage);
+
+/* ---------- Scene sequencing (blinks + lightning) ---------- */
+
+let nextBlink = 2.5, blinkStart = -1;
+let nextStrike = FIRST_STRIKE, strikeStart = -1;
+let op = {};   // opacity for each controlled layer this frame, by id
+
+const total = steps => steps.reduce((s, st) => s + st[0], 0);
+
+// Which layer is showing u seconds into a sequence? (null = gap, or not started / finished)
+function pick(u, steps) {
+  if (u < 0) return null;
+  let acc = 0;
+  for (const [dur, id] of steps) {
+    acc += dur;
+    if (u < acc) return id;
+  }
+  return null;
+}
+
+// Snap text: pops on sharply with a flicker, holds, then fades out slowly (like screen burn)
+function snapAmount(u, at) {
+  const k = u - at;
+  if (k < 0) return 0;
+  if (k < SNAP_HOLD) return 0.8 + 0.2 * Math.sin(k * 80);
+  const f = (k - SNAP_HOLD) / SNAP_FADE;
+  return f >= 1 ? 0 : (1 - f) * (1 - f);
+}
+
+// A strike ends once the glow and both snap texts have finished
+const STRIKE_END = Math.max(GLOW_HOLD + GLOW_FADE, SNAP1_AT + SNAP_HOLD + SNAP_FADE, SNAP2_AT + SNAP_HOLD + SNAP_FADE);
+
+function glowAmount(u) {
+  if (u < 0.06) return 0;
+  if (u < 0.20) return (u - 0.06) / 0.14;                  // fast fade in with the flash
+  if (u < GLOW_HOLD) return 1;
+  if (u < GLOW_HOLD + GLOW_FADE) return 1 - (u - GLOW_HOLD) / GLOW_FADE;
+  return 0;
+}
+
+function runScene(t) {
+  op = {};
+
+  // Start a lightning strike when it's time
+  if (strikeStart < 0 && t >= nextStrike) {
+    strikeStart = t;
+    blinkStart = -1;                                       // cancel any normal blink
+  }
+
+  if (strikeStart >= 0) {
+    const u = t - strikeStart;
+    const light = pick(u, STRIKE_LIGHTS);
+    if (light) op[light] = 1;
+    op.glowbase = glowAmount(u);
+    op.snap1 = snapAmount(u, SNAP1_AT);
+    op.snap2 = snapAmount(u, SNAP2_AT);
+    const gb = pick(u - GLOW_BLINK_AT, GLOW_BLINK);
+    if (gb) op[gb] = 1;
+
+    if (u > STRIKE_END) {
+      strikeStart = -1;
+      nextStrike = t + rand(STRIKE_GAP);
+      nextBlink = Math.max(nextBlink, t + 1.5);
+    }
+  } else {
+    // Normal random blinking
+    if (blinkStart < 0 && t >= nextBlink) blinkStart = t;
+    if (blinkStart >= 0) {
+      const u = t - blinkStart;
+      const f = pick(u, BLINK);
+      if (f) op[f] = 1;
+      if (u > total(BLINK)) {
+        blinkStart = -1;
+        nextBlink = t + rand(BLINK_GAP);
+      }
+    }
+  }
+}
+
+/* ---------- Movement state ---------- */
+
+let tx = 0, ty = 0, cx = 0, cy = 0;
+
+function frame(now) {
+  const t = now / 1000;
+  cx += (tx - cx) * SMOOTHING;
+  cy += (ty - cy) * SMOOTHING;
+
+  runScene(t);
+
+  for (const l of layers) {
+    const dx = -cx * l.shift * DIRECTION;
+    const dy = -cy * l.shift * DIRECTION;
+
+    const rot =
+      cx * l.rotate * DIRECTION +
+      Math.sin(t * TAU / IDLE_PERIOD + l.phase) * l.idleRotate;
+
+    let sx = 1, sy = 1;
+    if (l.breathe) {
+      const s = Math.sin(t * TAU / l.breathPeriod + l.breathPhase);
+      sy = 1 + l.breathe * s;
+      sx = 1 + l.breathe * l.breatheX * s;
+    }
+
+    l.el.style.transform =
+      "translate3d(" + dx + "px," + dy + "px,0) rotate(" + rot + "deg) scale(" + sx + "," + sy + ")";
+
+    if (l.controlled) {
+      const v = op[l.id] || 0;
+      if (v !== l.lastOp) { l.el.style.opacity = v; l.lastOp = v; }
+    }
+  }
+  requestAnimationFrame(frame);
+}
+if (!reduceMotion) requestAnimationFrame(frame);
+
+/* ---------- Input: mouse, tilt, taps ---------- */
+
+stage.addEventListener("pointermove", e => {
+  if (e.pointerType === "touch" || reduceMotion) return;
+  const r = stage.getBoundingClientRect();
+  tx = clamp(((e.clientX - r.left) / r.width) * 2 - 1, -1, 1);
+  ty = clamp(((e.clientY - r.top) / r.height) * 2 - 1, -1, 1);
+});
+stage.addEventListener("pointerleave", e => {
+  if (e.pointerType !== "touch") { tx = 0; ty = 0; }
+});
+
+let base = null;
+let gotSensor = false;
+
+function onOrientation(e) {
+  if (e.gamma == null || e.beta == null || reduceMotion) return;
+  gotSensor = true;
+  if (!base) base = { g: e.gamma, b: e.beta };
+  tx = clamp((e.gamma - base.g) / TILT_RANGE, -1, 1);
+  ty = clamp((e.beta - base.b) / TILT_RANGE, -1, 1);
+}
+
+function showHint(text, ms) {
+  hint.textContent = text;
+  hint.classList.remove("hidden", "fade");
+  clearTimeout(showHint.t);
+  showHint.t = setTimeout(() => {
+    hint.classList.add("fade");
+    setTimeout(() => hint.classList.add("hidden"), 700);
+  }, ms);
+}
+
+function startTilt() {
+  window.addEventListener("deviceorientation", onOrientation);
+  enableBtn.classList.add("hidden");
+  showHint("Tilt your phone. Tap for lightning. Double-tap to re-center.", 5000);
+  setTimeout(() => {
+    if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
+  }, 1500);
+}
+
+// Tap = lightning. Double-tap = re-center the tilt.
+let lastTap = 0;
+stage.addEventListener("pointerdown", () => {
+  const now = performance.now();
+  if (now - lastTap < 350) {
+    base = null;
+    lastTap = 0;
+    showHint("Re-centered.", 1200);
+    return;
+  }
+  lastTap = now;
+  if (strikeStart < 0 && !reduceMotion) nextStrike = 0;
+});
+
+const needsPermission =
+  typeof DeviceOrientationEvent !== "undefined" &&
+  typeof DeviceOrientationEvent.requestPermission === "function";
+
+const isTouch = matchMedia("(pointer: coarse)").matches;
+
+if (needsPermission) {
+  enableBtn.classList.remove("hidden");
+  enableBtn.addEventListener("click", async () => {
+    try {
+      const result = await DeviceOrientationEvent.requestPermission();
+      if (result === "granted") {
+        startTilt();
+      } else {
+        enableBtn.classList.add("hidden");
+        showHint("Motion access was denied. Reload the page to try again.", 5000);
+      }
+    } catch (err) {
+      showHint("Couldn't enable tilt on this page.", 4000);
+    }
+  });
+} else if (isTouch && "DeviceOrientationEvent" in window) {
+  startTilt();
+} else {
+  showHint("Move your mouse over the image. Click for lightning.", 4000);
+}
+</script>
+</body>
+</html>
