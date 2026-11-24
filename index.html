@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tilt Parallax</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #151515; overflow: hidden; }
+  body { display: grid; place-items: center; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  .stage {
+    --ar: 1;
+    position: relative;
+    width: min(100vw, calc(100dvh * var(--ar)));
+    aspect-ratio: var(--ar);
+    overflow: hidden;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .layer {
+    position: absolute;
+    left: 0; top: 0; width: 100%; height: 100%;
+    object-fit: fill;
+    will-change: transform;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  .ui {
+    position: absolute; left: 0; right: 0; bottom: max(16px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    pointer-events: none;
+  }
+  button#enable, button#micBtn {
+    pointer-events: auto;
+    font-weight: 600; font-size: 15px; line-height: 1; font-family: inherit;
+    padding: 12px 20px; border-radius: 999px; border: 0;
+    background: #f2f2f2; color: #151515; cursor: pointer;
+  }
+  button#enable:focus-visible, button#micBtn:focus-visible { outline: 3px solid #7fb4ff; outline-offset: 3px; }
+  .hint {
+    font-size: 13px; color: #fff; background: rgba(0,0,0,.55);
+    padding: 6px 12px; border-radius: 999px;
+    transition: opacity .6s ease;
+  }
+  .hidden { display: none !important; }
+  .fade { opacity: 0; }
+
+  /* microphone status pill (top right) */
+  .micstat {
+    position: absolute; top: max(12px, env(safe-area-inset-top)); right: 12px; z-index: 5;
+    display: flex; align-items: center; gap: 7px; font: inherit; font-size: 12px; line-height: 1;
+    padding: 8px 12px; border-radius: 999px; border: 0; cursor: pointer;
+    background: rgba(0,0,0,.55); color: #fff;
+  }
+  .micstat:focus-visible { outline: 3px solid #7fb4ff; outline-offset: 2px; }
+  .micstat i { width: 9px; height: 9px; border-radius: 50%; background: #5be38d; transition: transform .15s, background .15s; }
+  .micstat.blip i { transform: scale(1.8); background: #fff; }
+
+  /* floating trailer window */
+  .vwin {
+    position: fixed; z-index: 40; left: 0; top: 0;
+    width: min(92vw, 460px); box-sizing: border-box; overflow: hidden;
+    border-radius: 14px; background: #0b0b0d; color: #fff;
+    border: 1px solid rgba(255,255,255,.18);
+    box-shadow: 0 18px 50px rgba(0,0,0,.65);
+    visibility: hidden; opacity: 0; transform: scale(.94);
+    transition: opacity .25s, transform .25s, visibility 0s .25s;
+  }
+  .vwin.open { visibility: visible; opacity: 1; transform: none; transition: opacity .25s, transform .25s; }
+  .vbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 6px 6px 6px 12px; font-size: 12px; letter-spacing: .04em; color: #cfcfd4;
+    background: #17171b; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  .vbar.drag { cursor: grabbing; }
+  .vclose {
+    flex: 0 0 auto; width: 32px; height: 32px; border: 0; border-radius: 50%;
+    background: rgba(255,255,255,.12); color: #fff; font-size: 18px; line-height: 1; cursor: pointer;
+  }
+  .vclose:focus-visible { outline: 3px solid #7fb4ff; outline-offset: 2px; }
+  .vwin video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; }
+  @media (prefers-reduced-motion: reduce) { .vwin, .vwin.open { transition: none; } }
+</style>
+</head>
+<body>
+
+<main class="stage" id="stage" aria-label="Animated portrait that shifts as you tilt your phone or move your mouse. Tap for lightning. Double-tap, or snap your fingers twice, to play the Season 2 trailer in a floating window.">
+  <div class="ui">
+    <button id="enable" class="hidden" type="button">Tap to enable tilt</button>
+    <button id="micBtn" class="hidden" type="button">Tap to enable snap detection</button>
+    <div id="hint" class="hint hidden"></div>
+  </div>
+  <button id="micStat" class="micstat hidden" type="button" aria-label="Listening for snaps. Tap to turn the microphone off."><i></i>Listening for snaps</button>
+</main>
+
+<section class="vwin" id="vwin" role="dialog" aria-label="Wednesday Season 2 trailer" aria-hidden="true">
+  <div class="vbar" id="vbar"><span>Wednesday &middot; Season 2 trailer</span><button class="vclose" id="vclose" type="button" aria-label="Close trailer">&times;</button></div>
+  <video id="vid" playsinline controls controlsList="nodownload noremoteplayback" preload="auto"></video>
+</section>
+
+<script>
+/* ======================= EDIT THESE ======================= */
+
+/*
+  LAYERS: list from BACK to FRONT (the order of lines = stacking order).
+
+  id          a short name the animation script uses
+  depth       0 = barely moves, 1+ = moves the most
+  controlled  true = the script fades this layer in and out (blink frames, glow, lightning)
+  rotate / idleRotate / breathe / origin   optional, same as before
+
+  Every layer of the portrait (base, blinks, glowbase, eye glow) shares PORTRAIT
+  settings so they always move together and never drift apart.
+*/
+const PORTRAIT = { depth: 0.60, breathe: 0.006, origin: "50% 85%" };
+
+const LAYERS = [
+  { id: "background", src: "layer1-wednesday-prt-background.png", depth: 0.15 },
+
+  // Text that flashes after each lightning strike, like screen burn (script-controlled)
+  { id: "snap1", src: "layer2-wednesday-prt-snap1.png", depth: 0.25, controlled: true },
+  { id: "snap2", src: "layer2-wednesday-prt-snap2.png", depth: 0.25, controlled: true },
+
+  // Lightning, behind the portrait
+  { id: "light1", src: "layer3-wednesday-prt-light1.png", depth: 0.30, controlled: true },
+  { id: "light2", src: "layer3-wednesday-prt-light2.png", depth: 0.30, controlled: true },
+  { id: "light3", src: "layer3-wednesday-prt-light3.png", depth: 0.30, controlled: true },
+
+  // Portrait: normal state and its blink frames
+  { id: "base",     src: "layer4-wednesday-prt-base.png",     ...PORTRAIT },
+  { id: "eyeblnk1", src: "layer5-wednesday-prt-eyeblnk1.png", ...PORTRAIT, controlled: true }, // half blink
+  { id: "eyeblnk2", src: "layer5-wednesday-prt-eyeblnk2.png", ...PORTRAIT, controlled: true }, // closed
+
+  // Portrait: glowing state (eyes glow + rim light) and its blink frames.
+  // These sit ABOVE glowbase in the list so the blink frames show on top of it.
+  { id: "glowbase", src: "layer6-wednesday-prt-glowbase.png", ...PORTRAIT, controlled: true },
+  { id: "eyeglow1", src: "layer5-wednesday-prt-eyeglow1.png", ...PORTRAIT, controlled: true }, // 1st half blink (glowing)
+  { id: "eyeglow2", src: "layer5-wednesday-prt-eyeglow2.png", ...PORTRAIT, controlled: true }, // 2nd half blink (glowing)
+
+  // The hand on her shoulder. Its depth is close to the portrait's so it stays on her shoulder.
+  // origin = where the hand touches the shoulder, as "x% y%" of the whole canvas (EDIT THIS).
+  // breatheX 1 = swells evenly in every direction; breathPhase offsets it from her breathing.
+  { id: "thing", src: "layer7-wednesday-prt-thing.png", depth: 0.60,
+    breathe: 0.010, breatheX: 1, breathPeriod: 3.4, breathPhase: 1.0, origin: "50% 60%" }
+];
+
+// ---- Movement feel ----
+const MAX_SHIFT = 0.03;      // front-layer travel as a fraction of image width
+const TILT_RANGE = 20;       // degrees of phone tilt for full movement
+const SMOOTHING = 0.08;      // 0.04 = floaty, 0.15 = snappy
+const DIRECTION = 1;         // set to -1 if the movement feels backwards
+const BREATH_PERIOD = 4.2;   // seconds per breath
+const IDLE_PERIOD = 7;       // seconds per idle sway cycle
+
+// ---- Blink: normal state. Each step is [seconds, layer to show] (null = nothing) ----
+const BLINK = [[0.05, "eyeblnk1"], [0.09, "eyeblnk2"], [0.06, "eyeblnk1"]];
+const BLINK_GAP = [2.5, 6];  // random wait between blinks (min, max seconds)
+
+// ---- Lightning strike ----
+const FIRST_STRIKE = 4;      // seconds before the first strike
+const STRIKE_GAP = [8, 14];  // random wait between strikes (min, max seconds)
+const STRIKE_LIGHTS = [
+  [0.06, "light1"], [0.06, "light2"], [0.08, "light3"],
+  [0.07, null],
+  [0.07, "light2"], [0.05, null], [0.06, "light1"]
+];
+const GLOW_HOLD = 3.0;       // seconds the glowing state lasts (from the strike)
+const GLOW_FADE = 0.8;       // seconds to fade back to normal
+const GLOW_BLINK_AT = 1.8;   // seconds after the strike when the glowing eyes blink
+const GLOW_BLINK = [
+  [0.06, "eyeglow1"], [0.06, "eyeglow2"], [0.10, "eyeblnk2"], [0.06, "eyeglow2"], [0.06, "eyeglow1"]
+];
+
+// ---- Snap text (screen-burn flash after each strike). Times are seconds after the strike ----
+const SNAP1_AT = 0.12;       // when the first text pops on
+const SNAP2_AT = 0.30;       // when the second text pops on
+const SNAP_HOLD = 0.5;       // how long each stays at full brightness (with a slight flicker)
+const SNAP_FADE = 1.6;       // how long each takes to fade out
+
+// ---- Trailer: double-tap (or two snaps) opens a floating window and plays it ----
+// Keep the MP4 in the same folder as this page. The file name must match exactly, including capitals and spaces.
+const VIDEO_SRC = "Wednesday Season 2 Official Trailer Netflix.mp4";
+const VIDEO_VOLUME = 1;              // 0 to 1
+const VIDEO_CLOSE_WHEN_DONE = true;  // true = the window closes by itself when the trailer ends
+const DOUBLE_TAP_TIME = 0.35;        // seconds allowed between the two taps
+const TAP_MAX_MOVE = 14;             // pixels a finger/mouse may move and still count as a tap
+
+// ---- Snap detection (microphone). Everything is analysed on your device; nothing is recorded or sent anywhere. ----
+const SNAP_SENSITIVITY = 1;   // higher = hears quieter snaps (try 1.5 or 2), lower = needs a louder snap (try 0.7)
+const SNAP_HIGHPASS = 2000;   // Hz: sounds below this (voices, hum, bass) are ignored; a snap is mostly above it
+const SNAP_MIN_PEAK = 0.04;   // how loud a snap must be at the microphone (0 to 1) before sensitivity is applied
+const SNAP_RISE = 3;          // a snap must peak this many times higher than the recent background peaks
+const SNAP_SHARPNESS = 5;     // how spiky it must be. Snaps are one short spike, steady noise and speech are not
+const SNAP_DECAY = 0.3;       // 0.04 s after a snap the sound must be down to this fraction of the snap's peak (or back to the background level)
+const SNAP_COOLDOWN = 0.12;   // seconds after a snap before another can count (stops one snap counting twice)
+const SNAP_PAIR_MIN = 0.18;   // the second snap must come at least this many seconds after the first...
+const SNAP_PAIR_MAX = 1.2;    // ...and no more than this many seconds after it
+
+/* ======================= CODE ======================= */
+
+const stage = document.getElementById("stage");
+const enableBtn = document.getElementById("enable");
+const hint = document.getElementById("hint");
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const rand = ([a, b]) => a + Math.random() * (b - a);
+const TAU = Math.PI * 2;
+
+// Build the layers
+const layers = LAYERS.map((cfg, i) => {
+  const img = new Image();
+  img.className = "layer";
+  img.alt = "";
+  img.draggable = false;
+  img.src = cfg.src;
+  img.style.transformOrigin = cfg.origin || "50% 50%";
+  if (cfg.controlled) img.style.opacity = 0;
+  stage.insertBefore(img, stage.querySelector(".ui"));
+  return {
+    id: cfg.id,
+    el: img,
+    depth: cfg.depth,
+    rotate: cfg.rotate || 0,
+    idleRotate: cfg.idleRotate || 0,
+    breathe: cfg.breathe || 0,
+    breatheX: cfg.breatheX != null ? cfg.breatheX : 0.35,
+    breathPeriod: cfg.breathPeriod || BREATH_PERIOD,
+    breathPhase: cfg.breathPhase || 0,
+    controlled: !!cfg.controlled,
+    phase: i * 1.7,
+    shift: 0,
+    lastOp: -1
+  };
+});
+
+// Match stage to the first layer's aspect ratio
+function setAspect() {
+  const first = layers[0].el;
+  if (first.naturalWidth) stage.style.setProperty("--ar", first.naturalWidth / first.naturalHeight);
+  sizeLayers();
+}
+layers[0].el.addEventListener("load", setAspect);
+if (layers[0].el.complete) setAspect();
+
+// Each layer is enlarged by the distance it can travel, so edges never show.
+function sizeLayers() {
+  const w = stage.clientWidth;
+  const h = stage.clientHeight;
+  layers.forEach(l => {
+    l.shift = l.depth * MAX_SHIFT * w;
+    const pad = l.shift;
+    l.el.style.left = -pad + "px";
+    l.el.style.top = -pad + "px";
+    l.el.style.width = (w + pad * 2) + "px";
+    l.el.style.height = (h + pad * 2) + "px";
+  });
+}
+new ResizeObserver(sizeLayers).observe(stage);
+
+/* ---------- Scene sequencing (blinks + lightning) ---------- */
+
+let nextBlink = 2.5, blinkStart = -1;
+let nextStrike = FIRST_STRIKE, strikeStart = -1;
+let op = {};   // opacity for each controlled layer this frame, by id
+
+const total = steps => steps.reduce((s, st) => s + st[0], 0);
+
+// Which layer is showing u seconds into a sequence? (null = gap, or not started / finished)
+function pick(u, steps) {
+  if (u < 0) return null;
+  let acc = 0;
+  for (const [dur, id] of steps) {
+    acc += dur;
+    if (u < acc) return id;
+  }
+  return null;
+}
+
+// Snap text: pops on sharply with a flicker, holds, then fades out slowly (like screen burn)
+function snapAmount(u, at) {
+  const k = u - at;
+  if (k < 0) return 0;
+  if (k < SNAP_HOLD) return 0.8 + 0.2 * Math.sin(k * 80);
+  const f = (k - SNAP_HOLD) / SNAP_FADE;
+  return f >= 1 ? 0 : (1 - f) * (1 - f);
+}
+
+// A strike ends once the glow and both snap texts have finished
+const STRIKE_END = Math.max(GLOW_HOLD + GLOW_FADE, SNAP1_AT + SNAP_HOLD + SNAP_FADE, SNAP2_AT + SNAP_HOLD + SNAP_FADE);
+
+function glowAmount(u) {
+  if (u < 0.06) return 0;
+  if (u < 0.20) return (u - 0.06) / 0.14;                  // fast fade in with the flash
+  if (u < GLOW_HOLD) return 1;
+  if (u < GLOW_HOLD + GLOW_FADE) return 1 - (u - GLOW_HOLD) / GLOW_FADE;
+  return 0;
+}
+
+function runScene(t) {
+  op = {};
+
+  // Start a lightning strike when it's time
+  if (strikeStart < 0 && t >= nextStrike) {
+    strikeStart = t;
+    blinkStart = -1;                                       // cancel any normal blink
+  }
+
+  if (strikeStart >= 0) {
+    const u = t - strikeStart;
+    const light = pick(u, STRIKE_LIGHTS);
+    if (light) op[light] = 1;
+    op.glowbase = glowAmount(u);
+    op.snap1 = snapAmount(u, SNAP1_AT);
+    op.snap2 = snapAmount(u, SNAP2_AT);
+    const gb = pick(u - GLOW_BLINK_AT, GLOW_BLINK);
+    if (gb) op[gb] = 1;
+
+    if (u > STRIKE_END) {
+      strikeStart = -1;
+      nextStrike = t + rand(STRIKE_GAP);
+      nextBlink = Math.max(nextBlink, t + 1.5);
+    }
+  } else {
+    // Normal random blinking
+    if (blinkStart < 0 && t >= nextBlink) blinkStart = t;
+    if (blinkStart >= 0) {
+      const u = t - blinkStart;
+      const f = pick(u, BLINK);
+      if (f) op[f] = 1;
+      if (u > total(BLINK)) {
+        blinkStart = -1;
+        nextBlink = t + rand(BLINK_GAP);
+      }
+    }
+  }
+}
+
+/* ---------- Movement state ---------- */
+
+let tx = 0, ty = 0, cx = 0, cy = 0;
+
+function frame(now) {
+  const t = now / 1000;
+  cx += (tx - cx) * SMOOTHING;
+  cy += (ty - cy) * SMOOTHING;
+
+  runScene(t);
+
+  for (const l of layers) {
+    const dx = -cx * l.shift * DIRECTION;
+    const dy = -cy * l.shift * DIRECTION;
+
+    const rot =
+      cx * l.rotate * DIRECTION +
+      Math.sin(t * TAU / IDLE_PERIOD + l.phase) * l.idleRotate;
+
+    let sx = 1, sy = 1;
+    if (l.breathe) {
+      const s = Math.sin(t * TAU / l.breathPeriod + l.breathPhase);
+      sy = 1 + l.breathe * s;
+      sx = 1 + l.breathe * l.breatheX * s;
+    }
+
+    l.el.style.transform =
+      "translate3d(" + dx + "px," + dy + "px,0) rotate(" + rot + "deg) scale(" + sx + "," + sy + ")";
+
+    if (l.controlled) {
+      const v = op[l.id] || 0;
+      if (v !== l.lastOp) { l.el.style.opacity = v; l.lastOp = v; }
+    }
+  }
+  requestAnimationFrame(frame);
+}
+if (!reduceMotion) requestAnimationFrame(frame);
+
+/* ---------- Input: mouse, tilt, taps ---------- */
+
+stage.addEventListener("pointermove", e => {
+  if (e.pointerType === "touch" || reduceMotion) return;
+  const r = stage.getBoundingClientRect();
+  tx = clamp(((e.clientX - r.left) / r.width) * 2 - 1, -1, 1);
+  ty = clamp(((e.clientY - r.top) / r.height) * 2 - 1, -1, 1);
+});
+stage.addEventListener("pointerleave", e => {
+  if (e.pointerType !== "touch") { tx = 0; ty = 0; }
+});
+
+let base = null;
+let gotSensor = false;
+
+function onOrientation(e) {
+  if (e.gamma == null || e.beta == null || reduceMotion) return;
+  gotSensor = true;
+  if (!base) base = { g: e.gamma, b: e.beta };
+  tx = clamp((e.gamma - base.g) / TILT_RANGE, -1, 1);
+  ty = clamp((e.beta - base.b) / TILT_RANGE, -1, 1);
+}
+
+function showHint(text, ms) {
+  hint.textContent = text;
+  hint.classList.remove("hidden", "fade");
+  clearTimeout(showHint.t);
+  showHint.t = setTimeout(() => {
+    hint.classList.add("fade");
+    setTimeout(() => hint.classList.add("hidden"), 700);
+  }, ms);
+}
+
+function startTilt() {
+  window.addEventListener("deviceorientation", onOrientation);
+  enableBtn.classList.add("hidden");
+  showHint("Tilt your phone. Tap for lightning. Double-tap for the trailer.", 5000);
+  setTimeout(() => {
+    if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
+  }, 1500);
+}
+
+/* ---------- Floating trailer window ---------- */
+
+const vwin = document.getElementById("vwin");
+const vbar = document.getElementById("vbar");
+const vclose = document.getElementById("vclose");
+const vid = document.getElementById("vid");
+vid.src = encodeURI(VIDEO_SRC);
+vid.volume = VIDEO_VOLUME;
+let videoOpen = false;
+
+vid.addEventListener("error", () => {
+  showHint("Couldn't load \"" + VIDEO_SRC + "\". Check the file is in the same folder as this page and the name matches.", 6000);
+});
+vid.addEventListener("ended", () => { if (VIDEO_CLOSE_WHEN_DONE) closeVideo(); });
+
+function placeWindow() {
+  const w = vwin.offsetWidth;
+  vwin.style.left = Math.max(8, (window.innerWidth - w) / 2) + "px";
+  vwin.style.top = Math.max(12, window.innerHeight * 0.08) + "px";
+}
+function openVideo() {
+  if (videoOpen) return;
+  videoOpen = true;
+  suspendMic();                                        // stop listening while it plays (also keeps phones from lowering the volume)
+  placeWindow();
+  vwin.classList.add("open");
+  vwin.setAttribute("aria-hidden", "false");
+  try { vid.currentTime = 0; } catch (e) {}
+  vid.muted = false;
+  vid.volume = VIDEO_VOLUME;
+  const p = vid.play();
+  if (p && p.catch) p.catch(() => {                    // sound blocked: start silently, the player's controls can turn it on
+    vid.muted = true;
+    vid.play().catch(() => {});
+    showHint("Tap the video to turn the sound on.", 4000);
+  });
+}
+function closeVideo() {
+  if (!videoOpen) return;
+  videoOpen = false;
+  vid.pause();
+  try { vid.currentTime = 0; } catch (e) {}
+  vwin.classList.remove("open");
+  vwin.setAttribute("aria-hidden", "true");
+  resumeMic();
+}
+vclose.addEventListener("click", closeVideo);
+window.addEventListener("keydown", e => { if (e.key === "Escape") closeVideo(); });
+
+// Drag the window by its title bar
+let drag = null;
+vbar.addEventListener("pointerdown", e => {
+  if (e.target.closest("button")) return;
+  const r = vwin.getBoundingClientRect();
+  drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, id: e.pointerId };
+  vbar.classList.add("drag");
+  vbar.setPointerCapture(e.pointerId);
+});
+vbar.addEventListener("pointermove", e => {
+  if (!drag || drag.id !== e.pointerId) return;
+  const x = clamp(e.clientX - drag.dx, 4, window.innerWidth - vwin.offsetWidth - 4);
+  const y = clamp(e.clientY - drag.dy, 4, window.innerHeight - vwin.offsetHeight - 4);
+  vwin.style.left = x + "px";
+  vwin.style.top = y + "px";
+});
+const endDrag = () => { drag = null; vbar.classList.remove("drag"); };
+vbar.addEventListener("pointerup", endDrag);
+vbar.addEventListener("pointercancel", endDrag);
+
+/* ---------- Taps: one = lightning, two in a row = trailer ---------- */
+
+// The second tap is noticed on press, but the video starts on release (phones only allow video from a release).
+let lastTap = 0, doubleId = null, tapStart = null;
+stage.addEventListener("pointerdown", e => {
+  if (e.target.closest && e.target.closest("button")) return;
+  const now = performance.now();
+  tapStart = { x: e.clientX, y: e.clientY };
+  if (now - lastTap < DOUBLE_TAP_TIME * 1000) {
+    lastTap = 0;
+    doubleId = e.pointerId;
+    return;
+  }
+  lastTap = now;
+  doubleId = null;
+  if (strikeStart < 0 && !reduceMotion) nextStrike = 0;
+});
+stage.addEventListener("pointerup", e => {
+  if (doubleId === null || e.pointerId !== doubleId) return;
+  doubleId = null;
+  if (tapStart && Math.hypot(e.clientX - tapStart.x, e.clientY - tapStart.y) <= TAP_MAX_MOVE) openVideo();
+});
+stage.addEventListener("pointercancel", () => { doubleId = null; });
+
+/* ---------- Microphone: two snaps in a row = trailer ---------- */
+
+/* DETECTOR START (plain functions: they only look at the numbers they are given) */
+// Looks at short slices of (high-passed) sound, one after another. A snap is a spike that is
+//   1) much louder than the recent background peaks, 2) sharp (one spike, not a steady sound), and
+//   3) back to about the background level a few hundredths of a second later. Steady noise, hum and speech fail one of these.
+// Returns the time of the snap when it is confirmed (a moment after it happens), otherwise 0.
+function makeSnapDetector(o) {
+  let floor = 0.01;        // recent background PEAK level: rises quickly, falls slowly
+  let last = -9;           // time of the last confirmed snap
+  let cand = null;         // a spike waiting to see whether it dies away
+  return function (buf, t) {
+    let peak = 0, sum = 0;
+    for (let i = 0; i < buf.length; i++) { const v = buf[i], a = v < 0 ? -v : v; if (a > peak) peak = a; sum += v * v; }
+    const rms = Math.sqrt(sum / buf.length);
+    const crest = peak / (rms + 1e-9);                       // high = one short spike, low = steady sound
+    if (cand) {
+      if (t - cand.t < o.settle) return 0;
+      const c = cand; cand = null;
+      if (peak < Math.max(c.peak * o.decay, c.floor * 2)) { last = c.t; return c.t; }   // back near the background level: a snap
+      return 0;                                                  // it kept going: not a snap
+    }
+    if (t - last > o.cooldown && peak > o.minPeak && peak > floor * o.rise && crest > o.sharpness) {
+      cand = { t, peak, floor };
+      return 0;
+    }
+    if (t - last > 0.3) floor += (Math.max(peak, 0.002) - floor) * (peak > floor ? o.floorUp : o.floorDown);
+    return 0;
+  };
+}
+// Call with the time of each snap. Returns true when it completes a pair (two snaps close together).
+function makePairDetector(o) {
+  let first = -9;
+  return function (t) {
+    const gap = t - first;
+    if (gap >= o.minGap && gap <= o.maxGap) { first = -9; return true; }
+    first = t;
+    return false;
+  };
+}
+/* DETECTOR END */
+
+const micBtn = document.getElementById("micBtn");
+const micStat = document.getElementById("micStat");
+const micSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && (window.AudioContext || window.webkitAudioContext));
+let micWanted = false;     // you switched snap detection on
+let micStream = null, micCtx = null, micNodes = null, micTimer = null;
+
+async function startMic() {
+  if (micStream) return;
+  // Switch off the phone's "clean-up" processing: it is built to remove sudden sounds like snaps
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  if (!micCtx) micCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (micCtx.state === "suspended") { try { await micCtx.resume(); } catch (e) {} }
+  const src = micCtx.createMediaStreamSource(micStream);
+  const hp = micCtx.createBiquadFilter();
+  hp.type = "highpass"; hp.frequency.value = SNAP_HIGHPASS; hp.Q.value = 0.7;
+  const an = micCtx.createAnalyser();
+  an.fftSize = 1024; an.smoothingTimeConstant = 0;
+  src.connect(hp); hp.connect(an);                          // not connected to the speakers, so there is no echo
+  micNodes = { src, hp };
+  const buf = new Float32Array(an.fftSize);
+  const snap = makeSnapDetector({
+    minPeak: SNAP_MIN_PEAK / SNAP_SENSITIVITY, rise: SNAP_RISE / SNAP_SENSITIVITY, sharpness: SNAP_SHARPNESS,
+    cooldown: SNAP_COOLDOWN, settle: 0.04, decay: SNAP_DECAY, floorUp: 0.05, floorDown: 0.03
+  });
+  const pair = makePairDetector({ minGap: SNAP_PAIR_MIN, maxGap: SNAP_PAIR_MAX });
+  micTimer = setInterval(() => {
+    an.getFloatTimeDomainData(buf);
+    const t = performance.now() / 1000;
+    const at = snap(buf, t);
+    if (!at) return;
+    micStat.classList.add("blip");
+    setTimeout(() => micStat.classList.remove("blip"), 150);
+    if (pair(at)) openVideo();
+    else showHint("Snap once more\u2026", 900);
+  }, 10);
+}
+function stopMicStream() {
+  clearInterval(micTimer); micTimer = null;
+  if (micNodes) { try { micNodes.src.disconnect(); micNodes.hp.disconnect(); } catch (e) {} micNodes = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+}
+function suspendMic() { if (micWanted) stopMicStream(); }
+async function resumeMic() {
+  if (!micWanted) return;
+  try { await startMic(); }
+  catch (e) {
+    micWanted = false;
+    micStat.classList.add("hidden");
+    micBtn.classList.remove("hidden");
+    showHint("Tap the microphone button to listen for snaps again.", 4000);
+  }
+}
+
+// Phones only let a video start by itself (like from a snap) if it has been started by a tap before,
+// so the first tap on the microphone button also plays and instantly pauses it, silently.
+let primed = false;
+function primeVideo() {
+  if (primed) return;
+  primed = true;
+  vid.muted = true;
+  const done = () => { vid.pause(); try { vid.currentTime = 0; } catch (e) {} vid.muted = false; };
+  const p = vid.play();
+  if (p && p.then) p.then(done, () => { primed = false; vid.muted = false; });
+  else done();
+}
+
+micBtn.addEventListener("click", async () => {
+  primeVideo();
+  try {
+    micWanted = true;
+    await startMic();
+    micBtn.classList.add("hidden");
+    micStat.classList.remove("hidden");
+    showHint("Listening. Snap twice, or double-tap, to play the trailer.", 5000);
+  } catch (err) {
+    micWanted = false;
+    stopMicStream();
+    micBtn.classList.add("hidden");
+    showHint("Microphone access was denied, so snaps won't work. Double-tap still plays the trailer.", 6000);
+  }
+});
+micStat.addEventListener("click", () => {
+  micWanted = false;
+  stopMicStream();
+  micStat.classList.add("hidden");
+  micBtn.classList.remove("hidden");
+  showHint("Snap detection is off.", 1500);
+});
+if (micSupported) micBtn.classList.remove("hidden");
+
+const needsPermission =
+  typeof DeviceOrientationEvent !== "undefined" &&
+  typeof DeviceOrientationEvent.requestPermission === "function";
+
+const isTouch = matchMedia("(pointer: coarse)").matches;
+
+if (needsPermission) {
+  enableBtn.classList.remove("hidden");
+  enableBtn.addEventListener("click", async () => {
+    try {
+      const result = await DeviceOrientationEvent.requestPermission();
+      if (result === "granted") {
+        startTilt();
+      } else {
+        enableBtn.classList.add("hidden");
+        showHint("Motion access was denied. Reload the page to try again.", 5000);
+      }
+    } catch (err) {
+      showHint("Couldn't enable tilt on this page.", 4000);
+    }
+  });
+} else if (isTouch && "DeviceOrientationEvent" in window) {
+  startTilt();
+} else {
+  showHint("Move your mouse over the image. Click for lightning. Double-click for the trailer.", 5000);
+  if (!micSupported) setTimeout(() => showHint("Snap detection isn't available here (browsers only allow the microphone on https pages). Double-tap still works.", 6000), 5500);
+}
+</script>
+</body>
+</html>
