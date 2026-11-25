@@ -180,6 +180,13 @@ const THUNDER_SRC = "Thunder - Sound Effect.mp3";
 const THUNDER_VOLUME = 1;    // 0 to 1
 const THUNDER_DELAY = 0;     // seconds to wait after the first flash before the sound starts (raise it if the file begins with a quiet lead-in, lower it toward 0 if it starts late)
 
+// ---- Rain sound: loops continuously, fades out when the trailer window opens and back in when it closes ----
+// Keep the MP3 in the same folder as this page. The file name must match exactly, including capitals and spaces.
+const RAIN_SRC = "Rain Sound Effect.mp3";
+const RAIN_VOLUME = 0.6;     // 0 to 1 (try lower if it drowns out the thunder)
+const RAIN_FADE_OUT = 1.2;   // seconds to fade out when the trailer opens
+const RAIN_FADE_IN = 2.0;    // seconds to fade back in when the trailer window closes
+
 // ---- Snap text (screen-burn flash). Plays on each snap the microphone hears, and on a double-tap. Times are seconds after that ----
 const SNAP1_AT = 0.12;       // when the first text pops on
 const SNAP2_AT = 0.30;       // when the second text pops on
@@ -474,13 +481,63 @@ function unlockThunder() {
     try { thunder.currentTime = 0; } catch (e) {}
     thunderPrimed = true;
     syncThunderMute();
-    ["pointerup", "click", "keydown", "touchend"].forEach(n => window.removeEventListener(n, unlockThunder, true));
+    checkUnlocked();
   };
   const p = thunder.play();
   if (p && p.then) p.then(() => finish(true), () => finish(false));
   else finish(true);
 }
-["pointerup", "click", "keydown", "touchend"].forEach(n => window.addEventListener(n, unlockThunder, true));
+
+/* ---------- Rain sound (continuous loop) ---------- */
+
+const rain = new Audio(encodeURI(RAIN_SRC));
+rain.loop = true;
+rain.preload = "auto";
+rain.volume = 0;
+let rainStarted = false, rainTarget = -1, rainFade = null;
+
+// Fade the rain to a volume (0 to 1) over a number of seconds. At 0 it is paused; above 0 it is playing.
+function fadeRain(target, secs) {
+  clearInterval(rainFade);
+  if (target > 0 && rain.paused) { const p = rain.play(); if (p && p.catch) p.catch(() => {}); }
+  const from = rain.volume, t0 = performance.now();
+  const step = () => {
+    const k = secs > 0 ? Math.min(1, (performance.now() - t0) / (secs * 1000)) : 1;
+    try { rain.volume = clamp(from + (target - from) * k, 0, 1); } catch (e) {}
+    if (k >= 1) { clearInterval(rainFade); if (target === 0) rain.pause(); }
+  };
+  step();
+  if (secs > 0) rainFade = setInterval(step, 30);
+}
+// Rain is on while the trailer window is closed, off while it is open
+function syncRain() {
+  if (!rainStarted) return;
+  const target = videoOpen ? 0 : RAIN_VOLUME;
+  if (target === rainTarget) return;
+  rainTarget = target;
+  fadeRain(target, target ? RAIN_FADE_IN : RAIN_FADE_OUT);
+}
+function startRain() {
+  if (rainStarted) return;
+  rainStarted = true;                                      // this runs inside a tap/click/key press, so the browser allows the sound
+  rainTarget = -1;
+  const p = rain.play();
+  if (p && p.catch) p.catch(() => { rainStarted = false; });
+  syncRain();
+}
+
+// The first tap, click or key press unlocks both sounds (browsers block sound until then)
+function checkUnlocked() {
+  if (thunderPrimed && rainStarted) {
+    ["pointerup", "click", "keydown", "touchend"].forEach(n => window.removeEventListener(n, unlockAudio, true));
+  }
+}
+function unlockAudio() {
+  startRain();
+  unlockThunder();
+  checkUnlocked();
+}
+["pointerup", "click", "keydown", "touchend"].forEach(n => window.addEventListener(n, unlockAudio, true));
 
 /* ---------- Floating trailer window ---------- */
 
@@ -506,6 +563,7 @@ function placeWindow() {
 function openVideo() {
   if (videoOpen) return;
   videoOpen = true;
+  syncRain();
   suspendMic();                                        // stop listening while it plays (also keeps phones from lowering the volume)
   placeWindow();
   vwin.classList.add("open");
@@ -523,6 +581,7 @@ function openVideo() {
 function closeVideo() {
   if (!videoOpen) return;
   videoOpen = false;
+  syncRain();
   vid.pause();
   try { vid.currentTime = 0; } catch (e) {}
   vwin.classList.remove("open");
