@@ -87,7 +87,7 @@
 </head>
 <body>
 
-<main class="stage" id="stage" aria-label="Animated portrait that shifts as you tilt your phone or move your mouse. Tap for lightning. Double-tap, or snap your fingers twice, to play the Season 2 trailer in a floating window.">
+<main class="stage" id="stage" aria-label="Animated portrait that shifts as you tilt your phone or move your mouse. Lightning strikes on its own. Double-tap, or snap your fingers, to flash the snap text. Double-tap, or snap twice, to play the Season 2 trailer in a floating window.">
   <div class="ui">
     <button id="enable" class="hidden" type="button">Tap to enable tilt</button>
     <button id="micBtn" class="hidden" type="button">Tap to enable snap detection</button>
@@ -120,7 +120,7 @@ const PORTRAIT = { depth: 0.60, breathe: 0.006, origin: "50% 85%" };
 const LAYERS = [
   { id: "background", src: "layer1-wednesday-prt-background.png", depth: 0.15 },
 
-  // Text that flashes after each lightning strike, like screen burn (script-controlled)
+  // Text that flashes like screen burn when you snap (microphone) or double-tap. Not tied to the lightning (script-controlled)
   { id: "snap1", src: "layer2-wednesday-prt-snap1.png", depth: 0.25, controlled: true },
   { id: "snap2", src: "layer2-wednesday-prt-snap2.png", depth: 0.25, controlled: true },
 
@@ -159,7 +159,7 @@ const IDLE_PERIOD = 7;       // seconds per idle sway cycle
 const BLINK = [[0.05, "eyeblnk1"], [0.09, "eyeblnk2"], [0.06, "eyeblnk1"]];
 const BLINK_GAP = [2.5, 6];  // random wait between blinks (min, max seconds)
 
-// ---- Lightning strike ----
+// ---- Lightning strike (happens on its own, at random times, with no user input) ----
 const FIRST_STRIKE = 4;      // seconds before the first strike
 const STRIKE_GAP = [8, 14];  // random wait between strikes (min, max seconds)
 const STRIKE_LIGHTS = [
@@ -174,7 +174,13 @@ const GLOW_BLINK = [
   [0.06, "eyeglow1"], [0.06, "eyeglow2"], [0.10, "eyeblnk2"], [0.06, "eyeglow2"], [0.06, "eyeglow1"]
 ];
 
-// ---- Snap text (screen-burn flash after each strike). Times are seconds after the strike ----
+// ---- Thunder sound: plays with every lightning strike, and is muted while the trailer is playing ----
+// Keep the MP3 in the same folder as this page. The file name must match exactly, including capitals and spaces.
+const THUNDER_SRC = "Thunder - Sound Effect.mp3";
+const THUNDER_VOLUME = 1;    // 0 to 1
+const THUNDER_DELAY = 0;     // seconds to wait after the first flash before the sound starts (raise it if the file begins with a quiet lead-in, lower it toward 0 if it starts late)
+
+// ---- Snap text (screen-burn flash). Plays on each snap the microphone hears, and on a double-tap. Times are seconds after that ----
 const SNAP1_AT = 0.12;       // when the first text pops on
 const SNAP2_AT = 0.30;       // when the second text pops on
 const SNAP_HOLD = 0.5;       // how long each stays at full brightness (with a slight flicker)
@@ -265,6 +271,7 @@ new ResizeObserver(sizeLayers).observe(stage);
 
 let nextBlink = 2.5, blinkStart = -1;
 let nextStrike = FIRST_STRIKE, strikeStart = -1;
+let snapStart = -1, snapPending = false;   // snap text runs on its own timeline, separate from the lightning
 let op = {};   // opacity for each controlled layer this frame, by id
 
 const total = steps => steps.reduce((s, st) => s + st[0], 0);
@@ -289,8 +296,13 @@ function snapAmount(u, at) {
   return f >= 1 ? 0 : (1 - f) * (1 - f);
 }
 
-// A strike ends once the glow and both snap texts have finished
-const STRIKE_END = Math.max(GLOW_HOLD + GLOW_FADE, SNAP1_AT + SNAP_HOLD + SNAP_FADE, SNAP2_AT + SNAP_HOLD + SNAP_FADE);
+// A strike ends once the glow has finished
+const STRIKE_END = GLOW_HOLD + GLOW_FADE;
+// The snap text sequence ends once both texts have faded out
+const SNAP_END = Math.max(SNAP1_AT, SNAP2_AT) + SNAP_HOLD + SNAP_FADE;
+
+// Called by a heard snap or a double-tap. The scene loop starts (or restarts) the text on its next frame.
+function triggerSnap() { if (!reduceMotion) snapPending = true; }
 
 function glowAmount(u) {
   if (u < 0.06) return 0;
@@ -307,6 +319,7 @@ function runScene(t) {
   if (strikeStart < 0 && t >= nextStrike) {
     strikeStart = t;
     blinkStart = -1;                                       // cancel any normal blink
+    playThunder();
   }
 
   if (strikeStart >= 0) {
@@ -314,8 +327,6 @@ function runScene(t) {
     const light = pick(u, STRIKE_LIGHTS);
     if (light) op[light] = 1;
     op.glowbase = glowAmount(u);
-    op.snap1 = snapAmount(u, SNAP1_AT);
-    op.snap2 = snapAmount(u, SNAP2_AT);
     const gb = pick(u - GLOW_BLINK_AT, GLOW_BLINK);
     if (gb) op[gb] = 1;
 
@@ -336,6 +347,15 @@ function runScene(t) {
         nextBlink = t + rand(BLINK_GAP);
       }
     }
+  }
+
+  // Snap text: independent of the lightning
+  if (snapPending) { snapPending = false; snapStart = t; }
+  if (snapStart >= 0) {
+    const u = t - snapStart;
+    op.snap1 = snapAmount(u, SNAP1_AT);
+    op.snap2 = snapAmount(u, SNAP2_AT);
+    if (u > SNAP_END) snapStart = -1;
   }
 }
 
@@ -413,11 +433,54 @@ function showHint(text, ms) {
 function startTilt() {
   window.addEventListener("deviceorientation", onOrientation);
   enableBtn.classList.add("hidden");
-  showHint("Tilt your phone. Tap for lightning. Double-tap for the trailer.", 5000);
+  showHint("Tilt your phone. Double-tap or snap your fingers for the trailer.", 5000);
   setTimeout(() => {
     if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
   }, 1500);
 }
+
+/* ---------- Thunder sound ---------- */
+
+const thunder = new Audio(encodeURI(THUNDER_SRC));
+thunder.preload = "auto";
+thunder.volume = THUNDER_VOLUME;
+let thunderPrimed = false, thunderTimer = null;
+
+// Thunder is silent whenever the trailer is actually playing (it keeps running, so it is audible again if the trailer is paused)
+function trailerPlaying() { return videoOpen && !vid.paused && !vid.ended; }
+function syncThunderMute() { if (thunderPrimed) thunder.muted = trailerPlaying(); }
+
+function playThunder() {
+  if (!thunderPrimed) return;                              // browsers block sound until the first tap/click/key press
+  clearTimeout(thunderTimer);
+  thunderTimer = setTimeout(() => {
+    syncThunderMute();
+    try { thunder.currentTime = 0; } catch (e) {}
+    const p = thunder.play();
+    if (p && p.catch) p.catch(() => {});
+  }, THUNDER_DELAY * 1000);
+}
+
+// Browsers only let a page make sound after you have interacted with it, so the first tap, click or key press
+// quietly "unlocks" the thunder (plays and instantly pauses it, muted). Strikes before that are silent.
+function unlockThunder() {
+  if (thunderPrimed || unlockThunder.busy) return;
+  unlockThunder.busy = true;
+  thunder.muted = true;
+  const finish = ok => {
+    unlockThunder.busy = false;
+    if (!ok) { thunder.muted = false; return; }
+    thunder.pause();
+    try { thunder.currentTime = 0; } catch (e) {}
+    thunderPrimed = true;
+    syncThunderMute();
+    ["pointerup", "click", "keydown", "touchend"].forEach(n => window.removeEventListener(n, unlockThunder, true));
+  };
+  const p = thunder.play();
+  if (p && p.then) p.then(() => finish(true), () => finish(false));
+  else finish(true);
+}
+["pointerup", "click", "keydown", "touchend"].forEach(n => window.addEventListener(n, unlockThunder, true));
 
 /* ---------- Floating trailer window ---------- */
 
@@ -433,6 +496,7 @@ vid.addEventListener("error", () => {
   showHint("Couldn't load \"" + VIDEO_SRC + "\". Check the file is in the same folder as this page and the name matches.", 6000);
 });
 vid.addEventListener("ended", () => { if (VIDEO_CLOSE_WHEN_DONE) closeVideo(); });
+["play", "playing", "pause", "ended"].forEach(n => vid.addEventListener(n, syncThunderMute));
 
 function placeWindow() {
   const w = vwin.offsetWidth;
@@ -488,7 +552,7 @@ const endDrag = () => { drag = null; vbar.classList.remove("drag"); };
 vbar.addEventListener("pointerup", endDrag);
 vbar.addEventListener("pointercancel", endDrag);
 
-/* ---------- Taps: one = lightning, two in a row = trailer ---------- */
+/* ---------- Taps: two in a row = snap text + trailer ---------- */
 
 // The second tap is noticed on press, but the video starts on release (phones only allow video from a release).
 let lastTap = 0, doubleId = null, tapStart = null;
@@ -499,11 +563,11 @@ stage.addEventListener("pointerdown", e => {
   if (now - lastTap < DOUBLE_TAP_TIME * 1000) {
     lastTap = 0;
     doubleId = e.pointerId;
+    triggerSnap();
     return;
   }
   lastTap = now;
   doubleId = null;
-  if (strikeStart < 0 && !reduceMotion) nextStrike = 0;
 });
 stage.addEventListener("pointerup", e => {
   if (doubleId === null || e.pointerId !== doubleId) return;
@@ -586,6 +650,7 @@ async function startMic() {
     if (!at) return;
     micStat.classList.add("blip");
     setTimeout(() => micStat.classList.remove("blip"), 150);
+    triggerSnap();
     if (pair(at)) openVideo();
     else showHint("Snap once more\u2026", 900);
   }, 10);
@@ -668,7 +733,7 @@ if (needsPermission) {
 } else if (isTouch && "DeviceOrientationEvent" in window) {
   startTilt();
 } else {
-  showHint("Move your mouse over the image. Click for lightning. Double-click for the trailer.", 5000);
+  showHint("Move your mouse over the image. Double-click, or snap your fingers, for the trailer. Click once anywhere to enable thunder sound.", 5000);
   if (!micSupported) setTimeout(() => showHint("Snap detection isn't available here (browsers only allow the microphone on https pages). Double-tap still works.", 6000), 5500);
 }
 </script>
