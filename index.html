@@ -144,7 +144,10 @@ const LAYERS = [
   // origin = where the hand touches the shoulder, as "x% y%" of the whole canvas (EDIT THIS).
   // breatheX 1 = swells evenly in every direction; breathPhase offsets it from her breathing.
   { id: "thing", src: "layer7-wednesday-prt-thing.png", depth: 0.60,
-    breathe: 0.010, breatheX: 1, breathPeriod: 3.4, breathPhase: 1.0, origin: "50% 60%" }
+    breathe: 0.010, breatheX: 1, breathPeriod: 3.4, breathPhase: 1.0, origin: "50% 60%" },
+
+  // Rain, in front of everything. kind "rain" = the script scrolls this image endlessly (see the Rain settings below)
+  { id: "rain", src: "layer8-wednesday-prt-rain.png", depth: 0.75, kind: "rain" }
 ];
 
 // ---- Movement feel ----
@@ -154,6 +157,18 @@ const SMOOTHING = 0.08;      // 0.04 = floaty, 0.15 = snappy
 const DIRECTION = 1;         // set to -1 if the movement feels backwards
 const BREATH_PERIOD = 4.2;   // seconds per breath
 const IDLE_PERIOD = 7;       // seconds per idle sway cycle
+
+// ---- Rain (layer8). The image is tiled and scrolled endlessly along the direction the drops fall ----
+// Raindrops reach their top speed almost instantly, so they fall at a CONSTANT speed (no acceleration).
+// A real drop falls ~9 m/s, which is far too fast to read on a screen (it would just flicker), so this is a
+// "looks right" speed: how many screen-heights a drop travels per second.
+const RAIN_SPEED = 1.6;           // screen-heights per second (try 1.2 = drizzle, 2.5 = downpour)
+// Direction of the fall, in degrees from straight down. Positive = drops move toward the right as they fall,
+// negative = toward the left. "auto" reads the angle of the streaks in your image.
+// (Auto needs the page to be served from a web server. If you open the file straight from your folder the browser
+//  blocks reading the image, so the RAIN_ANGLE_FALLBACK value below is used instead.)
+const RAIN_ANGLE = "auto";
+const RAIN_ANGLE_FALLBACK = 0;
 
 // ---- Blink: normal state. Each step is [seconds, layer to show] (null = nothing) ----
 const BLINK = [[0.05, "eyeblnk1"], [0.09, "eyeblnk2"], [0.06, "eyeblnk1"]];
@@ -231,12 +246,23 @@ const layers = LAYERS.map((cfg, i) => {
   img.alt = "";
   img.draggable = false;
   img.src = cfg.src;
-  img.style.transformOrigin = cfg.origin || "50% 50%";
-  if (cfg.controlled) img.style.opacity = 0;
-  stage.insertBefore(img, stage.querySelector(".ui"));
-  return {
+
+  // The rain layer is drawn onto a canvas (two or three tiles of the same image, shifted every frame)
+  let el = img, rain = null;
+  if (cfg.kind === "rain") {
+    el = document.createElement("canvas");
+    el.className = "layer";
+    el.setAttribute("aria-hidden", "true");
+    rain = { img, ctx: el.getContext("2d"), fx: 0, fy: 0, ang: 0, dpr: 1, W: 0, H: 0, pad: 0, ready: false };
+  }
+
+  el.style.transformOrigin = cfg.origin || "50% 50%";
+  if (cfg.controlled) el.style.opacity = 0;
+  stage.insertBefore(el, stage.querySelector(".ui"));
+  const entry = {
     id: cfg.id,
-    el: img,
+    el,
+    rain,
     depth: cfg.depth,
     rotate: cfg.rotate || 0,
     idleRotate: cfg.idleRotate || 0,
@@ -249,6 +275,12 @@ const layers = LAYERS.map((cfg, i) => {
     shift: 0,
     lastOp: -1
   };
+  if (rain) rain.img.addEventListener("load", () => {
+    rain.ready = true;
+    rain.ang = clamp(Number(chooseRainAngle(rain.img)) || 0, -60, 60);
+    drawRain(entry);
+  });
+  return entry;
 });
 
 // Match stage to the first layer's aspect ratio
@@ -271,7 +303,82 @@ function sizeLayers() {
     l.el.style.top = -pad + "px";
     l.el.style.width = (w + pad * 2) + "px";
     l.el.style.height = (h + pad * 2) + "px";
+    if (l.rain) {
+      const r = l.rain;
+      r.dpr = Math.min(window.devicePixelRatio || 1, 2);
+      r.W = w; r.H = h; r.pad = pad;
+      l.el.width = Math.round((w + pad * 2) * r.dpr);       // (setting the size also clears the canvas)
+      l.el.height = Math.round((h + pad * 2) * r.dpr);
+      drawRain(l);
+    }
   });
+}
+
+/* ---------- Rain ---------- */
+
+// Streak direction of an image, in degrees from straight down (positive = leaning to the right as it falls).
+// `a` is a w*h array of "how much stuff is here" values. Returns null if there is no clear direction.
+function streakAngle(a, w, h) {
+  let jxx = 0, jyy = 0, jxy = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;                                           // Sobel: a smoother, more even edge measurement
+      const gx = (a[i - w + 1] + 2 * a[i + 1] + a[i + w + 1]) - (a[i - w - 1] + 2 * a[i - 1] + a[i + w - 1]);
+      const gy = (a[i + w - 1] + 2 * a[i + w] + a[i + w + 1]) - (a[i - w - 1] + 2 * a[i - w] + a[i - w + 1]);
+      jxx += gx * gx; jyy += gy * gy; jxy += gx * gy;
+    }
+  }
+  const tot = jxx + jyy;
+  if (!(tot > 0)) return null;
+  if (Math.hypot(jxx - jyy, 2 * jxy) / tot < 0.2) return null;      // edges point every which way: no clear direction
+  const phi = 0.5 * Math.atan2(2 * jxy, jxx - jyy);                 // direction the brightness changes fastest...
+  let dx = -Math.sin(phi), dy = Math.cos(phi);                      // ...and streaks run at right angles to that
+  if (dy < 0) { dx = -dx; dy = -dy; }                               // make it point downward
+  return Math.atan2(dx, dy) * 180 / Math.PI;
+}
+function detectRainAngle(img) {
+  try {
+    const sc = Math.min(1, 320 / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(8, Math.round(img.naturalWidth * sc)), h = Math.max(8, Math.round(img.naturalHeight * sc));
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const g = c.getContext("2d", { willReadFrequently: true });
+    g.drawImage(img, 0, 0, w, h);
+    const d = g.getImageData(0, 0, w, h).data;                       // throws if the browser blocks reading the image
+    const a = new Float32Array(w * h);
+    let minA = 255;
+    for (let i = 0; i < w * h; i++) { a[i] = d[i * 4 + 3]; if (a[i] < minA) minA = a[i]; }
+    if (minA > 250) for (let i = 0; i < w * h; i++) a[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];  // no transparency: use brightness
+    return streakAngle(a, w, h);
+  } catch (e) { return null; }
+}
+function chooseRainAngle(img) {
+  if (RAIN_ANGLE !== "auto") return RAIN_ANGLE;
+  const d = detectRainAngle(img);
+  console.info("Rain angle: " + (d == null ? "could not be read from the image, using RAIN_ANGLE_FALLBACK (" + RAIN_ANGLE_FALLBACK + "\u00B0)" : d.toFixed(1) + "\u00B0 (read from the image)"));
+  return d == null ? RAIN_ANGLE_FALLBACK : d;
+}
+
+// Draw the rain tiles. Tiles are placed on whole device pixels so neighbouring tiles meet without hairline gaps.
+function drawRain(l) {
+  const r = l.rain;
+  if (!r || !r.ready || !r.W) return;
+  const c = l.el, g = r.ctx;
+  const Wd = Math.max(1, Math.round(r.W * r.dpr)), Hd = Math.max(1, Math.round(r.H * r.dpr));
+  const ax = Math.round(r.pad * r.dpr + r.fx * Wd), ay = Math.round(r.pad * r.dpr + r.fy * Hd);
+  const x0 = ((ax % Wd) + Wd) % Wd - Wd, y0 = ((ay % Hd) + Hd) % Hd - Hd;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, c.width, c.height);
+  for (let y = y0; y < c.height; y += Hd) for (let x = x0; x < c.width; x += Wd) g.drawImage(r.img, x, y, Wd, Hd);
+}
+// Move the rain along its fall direction. Time-based, so the speed is the same at 30, 60 or 120 fps.
+function stepRain(l, dt) {
+  const r = l.rain;
+  if (!r.ready || !r.W) return;
+  const dist = RAIN_SPEED * r.H * dt, a = r.ang * Math.PI / 180;
+  r.fx = (r.fx + Math.sin(a) * dist / r.W) % 1;
+  r.fy = (r.fy + Math.cos(a) * dist / r.H) % 1;
+  drawRain(l);
 }
 new ResizeObserver(sizeLayers).observe(stage);
 
@@ -371,14 +478,19 @@ function runScene(t) {
 
 let tx = 0, ty = 0, cx = 0, cy = 0;
 
+let lastT = 0;
+
 function frame(now) {
   const t = now / 1000;
+  const dt = lastT ? Math.min(0.1, t - lastT) : 0;   // seconds since the last frame (capped so a background tab doesn't cause a jump)
+  lastT = t;
   cx += (tx - cx) * SMOOTHING;
   cy += (ty - cy) * SMOOTHING;
 
   runScene(t);
 
   for (const l of layers) {
+    if (l.rain) stepRain(l, dt);
     const dx = -cx * l.shift * DIRECTION;
     const dy = -cy * l.shift * DIRECTION;
 
