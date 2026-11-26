@@ -184,6 +184,7 @@ const THUNDER_DELAY = 0;     // seconds to wait after the first flash before the
 // Keep the MP3 in the same folder as this page. The file name must match exactly, including capitals and spaces.
 const RAIN_SRC = "Rain Sound Effect.mp3";
 const RAIN_VOLUME = 0.6;     // 0 to 1 (try lower if it drowns out the thunder)
+const RAIN_CROSSFADE = 3;    // seconds the end of the rain blends into its own start, so the loop has no seam (0 = plain hard loop)
 const RAIN_FADE_OUT = 1.2;   // seconds to fade out when the trailer opens
 const RAIN_FADE_IN = 2.0;    // seconds to fade back in when the trailer window closes
 
@@ -490,21 +491,62 @@ function unlockThunder() {
 
 /* ---------- Rain sound (continuous loop) ---------- */
 
-const rain = new Audio(encodeURI(RAIN_SRC));
-rain.loop = true;
-rain.preload = "auto";
-rain.volume = 0;
-let rainStarted = false, rainTarget = -1, rainFade = null;
+// Two copies of the rain file take turns. When one is about to finish, the other starts and fades in
+// while the first fades out, so there is never an audible "restart".
+const rainEls = [0, 1].map(() => { const a = new Audio(encodeURI(RAIN_SRC)); a.preload = "auto"; a.volume = 0; return a; });
+let rainStarted = false, rainTarget = -1, rainLevel = 0, rainFade = null, rainTimer = null, rainSuspended = [];
 
-// Fade the rain to a volume (0 to 1) over a number of seconds. At 0 it is paused; above 0 it is playing.
+const eqPower = k => Math.sin(clamp(k, 0, 1) * Math.PI / 2);       // equal-power curve: no dip in loudness mid-blend
+function rainXf(el) {
+  const d = el.duration;
+  return RAIN_CROSSFADE > 0 && isFinite(d) && d > 0 ? Math.min(RAIN_CROSSFADE, d / 3) : 0;
+}
+// 0 to 1: fades in over the first moments of a copy and out over its last moments
+function rainEnvelope(el) {
+  const xf = rainXf(el);
+  if (!xf) return 1;
+  return eqPower(el.currentTime / xf) * eqPower((el.duration - el.currentTime) / xf);
+}
+function applyRain() {
+  rainEls.forEach(el => { try { el.volume = el.paused ? 0 : clamp(rainLevel * rainEnvelope(el), 0, 1); } catch (e) {} });
+}
+function playRainEl(el, from) {
+  try { el.currentTime = from || 0; } catch (e) {}
+  const p = el.play();
+  if (p && p.catch) p.catch(() => {});
+}
+// Runs every 40 ms while the rain is on: retires finished copies and starts the next one in time for the blend
+function rainTick() {
+  if (rainTarget <= 0) return;
+  rainEls.forEach(el => {
+    if (!el.paused && isFinite(el.duration) && el.currentTime >= el.duration - 0.05) { el.pause(); try { el.currentTime = 0; } catch (e) {} }
+  });
+  const active = rainEls.filter(el => !el.paused);
+  const idle = rainEls.find(el => el.paused);
+  if (!active.length) { playRainEl(idle || rainEls[0], 0); }
+  else if (active.length === 1 && idle) {
+    const cur = active[0], xf = rainXf(cur);
+    if (xf && cur.duration - cur.currentTime <= xf) playRainEl(idle, 0);
+  }
+  applyRain();
+}
+
+// Fade the overall rain level to a volume (0 to 1) over a number of seconds
 function fadeRain(target, secs) {
   clearInterval(rainFade);
-  if (target > 0 && rain.paused) { const p = rain.play(); if (p && p.catch) p.catch(() => {}); }
-  const from = rain.volume, t0 = performance.now();
+  if (target > 0 && !rainEls.some(el => !el.paused)) {      // coming back from silence: continue where each copy was
+    (rainSuspended.length ? rainSuspended : [rainEls[0]]).forEach(el => playRainEl(el, rainSuspended.length ? el.currentTime : 0));
+    rainSuspended = [];
+  }
+  const from = rainLevel, t0 = performance.now();
   const step = () => {
     const k = secs > 0 ? Math.min(1, (performance.now() - t0) / (secs * 1000)) : 1;
-    try { rain.volume = clamp(from + (target - from) * k, 0, 1); } catch (e) {}
-    if (k >= 1) { clearInterval(rainFade); if (target === 0) rain.pause(); }
+    rainLevel = clamp(from + (target - from) * k, 0, 1);
+    applyRain();
+    if (k >= 1) {
+      clearInterval(rainFade);
+      if (target === 0) { rainSuspended = rainEls.filter(el => !el.paused); rainEls.forEach(el => el.pause()); }
+    }
   };
   step();
   if (secs > 0) rainFade = setInterval(step, 30);
@@ -521,8 +563,14 @@ function startRain() {
   if (rainStarted) return;
   rainStarted = true;                                      // this runs inside a tap/click/key press, so the browser allows the sound
   rainTarget = -1;
-  const p = rain.play();
+  rainEls.forEach(el => { el.loop = RAIN_CROSSFADE <= 0; });
+  const p = rainEls[0].play();
   if (p && p.catch) p.catch(() => { rainStarted = false; });
+  // Let the second copy "wake up" inside this same tap too (some phones only allow sound that starts from a tap)
+  const q = rainEls[1].play();
+  if (q && q.then) q.then(() => { rainEls[1].pause(); try { rainEls[1].currentTime = 0; } catch (e) {} }).catch(() => {});
+  clearInterval(rainTimer);
+  rainTimer = setInterval(rainTick, 40);
   syncRain();
 }
 
