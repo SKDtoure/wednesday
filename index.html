@@ -218,7 +218,7 @@ const DOUBLE_TAP_TIME = 0.35;        // seconds allowed between the two taps
 const TAP_MAX_MOVE = 14;             // pixels a finger/mouse may move and still count as a tap
 
 // ---- Snap detection (microphone). Everything is analysed on your device; nothing is recorded or sent anywhere. ----
-const SNAP_SENSITIVITY = 1;   // higher = hears quieter snaps (try 1.5 or 2), lower = needs a louder snap (try 0.7)
+const SNAP_SENSITIVITY = 0.7;   // higher = hears quieter snaps (try 1.5 or 2), lower = needs a louder snap (try 0.7)
 const SNAP_HIGHPASS = 2000;   // Hz: sounds below this (voices, hum, bass) are ignored; a snap is mostly above it
 const SNAP_MIN_PEAK = 0.04;   // how loud a snap must be at the microphone (0 to 1) before sensitivity is applied
 const SNAP_RISE = 3;          // a snap must peak this many times higher than the recent background peaks
